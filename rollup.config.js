@@ -25,12 +25,18 @@ function builder({ name }) {
       }
     },
     writeBundle({ dir }) {
-      if (dir && fs.existsSync(dir)) {
-        chp.exec('glib-compile-schemas schemas', { cwd: dir }, (error, stdout, stderr) => {
-          if (error || stderr) {
-            console.error(error || stderr)
-          }
+      if (!dir || !fs.existsSync(`${dir}/schemas`))
+        return
+
+      try {
+        chp.execSync('glib-compile-schemas --strict schemas', {
+          cwd: dir,
+          stdio: 'inherit'
         })
+      } catch (error) {
+        console.error('glib-compile-schemas failed')
+        if (process.env.package)
+          throw error
       }
     }
   }
@@ -49,7 +55,7 @@ export default {
       hook: 'writeBundle',
       targets: [
         'dist/empty.js',
-        'build/*.zip'
+        ...(process.env.package ? ['build/*.zip'] : [])
       ]
     }),
     copy({

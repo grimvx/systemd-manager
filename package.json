@@ -1,6 +1,6 @@
 {
   "name": "systemd-manager",
-  "version": "20",
+  "version": "21",
   "description": "GNOME Shell systemmd management extension",
   "repository": "https://github.com/hardpixel/systemd-manager",
   "author": "Jonian Guveli",

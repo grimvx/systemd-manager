@@ -1,73 +1,126 @@
-import GLib from 'gi://GLib'
+import Gio from 'gi://Gio'
 
-function safeSpawn(cmd) {
+const ACTIONS = new Set(['start', 'stop', 'restart', 'mask', 'unmask'])
+const TYPES = new Set(['system', 'user'])
+const LIST_ARGS = ['--type=service,timer,mount', '--no-legend', '--plain', '--no-pager']
+
+function launch(argv, flags) {
+  const launcher = new Gio.SubprocessLauncher({flags})
+  launcher.setenv('SYSTEMD_COLORS', '0', true)
+  launcher.setenv('SYSTEMD_PAGER', 'cat', true)
+  return launcher.spawnv(argv)
+}
+
+// Returns stdout, or null when the command could not run or produced no
+// output on a non-zero exit. is-active uses a non-zero exit for inactive
+// units while still printing one status line per unit, so stdout is kept.
+function runSync(argv) {
   try {
-    return GLib.spawn_command_line_sync(cmd)
-  } catch (e) {
-    return [false, [], null, null]
+    const proc = launch(
+      argv,
+      Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+    )
+    const [, stdout] = proc.communicate_utf8(null, null)
+    const text = stdout ?? ''
+
+    if (!proc.get_successful() && text.trim() === '')
+      return null
+
+    return text
+  } catch (error) {
+    console.error(`[systemd-manager] ${argv.join(' ')} failed: ${error.message}`)
+    return null
   }
 }
 
-function command(args, pipe) {
-  const cmd = [].concat(args).filter(item => !!item).join(' ')
-  const str = pipe ? [cmd, pipe].join(' | ') : cmd
+function unitNames(text) {
+  if (!text)
+    return []
 
-  return safeSpawn(`sh -c "${str}"`)
-}
-
-function systemctl(type, args, pipe) {
-  const cmd = [`systemctl --${type}`].concat(args)
-  return command(cmd, pipe)
-}
-
-function systemctlList(type, args) {
-  const res = systemctl(type, args, "awk '{print $1}'")
-  const out = String.fromCharCode(...res[1])
-
-  return out.split('\n').filter(item => !!item)
-}
-
-function systemctlStates(type, flag, services) {
-  const res = systemctl(type, [flag, ...services])
-  const out = String.fromCharCode(...res[1])
-
-  return out.split('\n').reduce(
-    (all, value, idx) => ({ ...all, [services[idx]]: value }), {}
-  )
+  return text.split('\n').flatMap(line => {
+    const name = line.trim().split(/\s+/)[0]
+    return name ? [name] : []
+  })
 }
 
 export function getServicesList(type) {
-  const args = ['--type=service,timer,mount', '--no-legend']
+  if (!TYPES.has(type))
+    return null
 
-  const res1 = systemctlList(type, ['list-unit-files', ...args])
-  const res2 = systemctlList(type, ['list-units', ...args])
-  const list = res1.concat(res2)
+  const files = runSync(['systemctl', `--${type}`, 'list-unit-files', ...LIST_ARGS])
+  const units = runSync(['systemctl', `--${type}`, 'list-units', ...LIST_ARGS])
 
-  return Array.from(new Set(list)).sort((first, second) => {
+  if (files === null && units === null)
+    return null
+
+  const names = [...unitNames(files), ...unitNames(units)]
+
+  return Array.from(new Set(names)).sort((first, second) => {
     return first.toLowerCase().localeCompare(second.toLowerCase())
   })
 }
 
-export function getServicesState(type, services) {
-  const states  = {}
+function systemctlStates(type, flag, services) {
+  const output = runSync([
+    'systemctl', `--${type}`, '--no-pager', flag, ...services
+  ])
+  const lines = (output ?? '').split('\n')
+  const states = {}
 
-  const active  = systemctlStates(type, 'is-active', services)
-  const enabled = systemctlStates(type, 'is-enabled', services)
+  services.forEach((service, index) => {
+    const value = lines[index]?.trim()
 
-  services.forEach(service => states[service] = {
-    'is-active':  active[service],
-    'is-enabled': enabled[service]
+    if (value)
+      states[service] = value
   })
 
   return states
 }
 
-export function runServiceAction(method, action, type, service) {
-  let cmd = `systemctl ${action} ${service} --${type}`
+export function getServicesState(type, services) {
+  const states = {}
 
-  if (method == 0 && type == 'system') {
-    cmd = `pkexec --user root ${cmd}`
+  if (!TYPES.has(type) || services.length === 0)
+    return states
+
+  const active = systemctlStates(type, 'is-active', services)
+  const enabled = systemctlStates(type, 'is-enabled', services)
+
+  for (const service of services) {
+    states[service] = {
+      'is-active': active[service] ?? 'unknown',
+      'is-enabled': enabled[service] ?? 'unknown'
+    }
   }
 
-  GLib.spawn_command_line_async(`sh -c "${cmd}; exit"`)
+  return states
+}
+
+export function runServiceAction(method, action, type, service) {
+  if (!ACTIONS.has(action) || !TYPES.has(type))
+    return
+
+  if (typeof service !== 'string' || !service || /[\s]/.test(service))
+    return
+
+  // argv1 stays the verb so the sample pkexec policy (which matches
+  // systemctl start|stop|restart) still applies. User units never go
+  // through pkexec; only the pkexec command method escalates system units.
+  const argv = ['systemctl', action, service, `--${type}`]
+
+  if (Number(method) === 0 && type === 'system')
+    argv.unshift('pkexec', '--user', 'root')
+
+  try {
+    const proc = launch(argv, Gio.SubprocessFlags.STDOUT_SILENCE)
+    proc.wait_async(null, (source, result) => {
+      try {
+        source.wait_finish(result)
+      } catch (error) {
+        console.error(`[systemd-manager] ${action} ${service} failed: ${error.message}`)
+      }
+    })
+  } catch (error) {
+    console.error(`[systemd-manager] Failed to run ${action} on ${service}: ${error.message}`)
+  }
 }
